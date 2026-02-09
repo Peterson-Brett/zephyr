@@ -29,6 +29,8 @@ LOG_MODULE_REGISTER(ifx_cat1_dma, CONFIG_DMA_LOG_LEVEL);
 #define CY_REMAP_ADDRESS_CBUS_TO_SAHB(addr) (addr)
 #endif
 
+#define DESCRIPTOR_POOL_SIZE (CONFIG_INFINEON_DESCRIPTOR_POOL_SIZE)
+
 struct ifx_cat1_dma_channel {
 	uint32_t channel_direction: 3;
 	uint32_t complete_callback_en: 1;
@@ -45,8 +47,6 @@ struct ifx_cat1_dma_channel {
 
 struct ifx_cat1_dma_data {
 	struct ifx_cat1_dma_channel *channels;
-	cy_stc_dma_descriptor_t descriptor_pool[CONFIG_INFINEON_DESCRIPTOR_POOL_SIZE];
-	ATOMIC_DEFINE(desc_allocated, CONFIG_INFINEON_DESCRIPTOR_POOL_SIZE);
 };
 
 struct ifx_cat1_dma_config {
@@ -56,18 +56,42 @@ struct ifx_cat1_dma_config {
 	uint8_t num_channels;
 };
 
-static cy_stc_dma_descriptor_t *ifx_cat1_dma_alloc_descriptor(const struct device *dev)
-{
-	uint32_t i;
-	struct ifx_cat1_dma_data *data = dev->data;
+/* DMA descriptor pool */
+K_MEM_SLAB_DEFINE_STATIC(dma_descriptor_pool_slab, sizeof(cy_stc_dma_descriptor_t),
+			 DESCRIPTOR_POOL_SIZE, 4);
 
-	for (i = 0u; i < CONFIG_INFINEON_DESCRIPTOR_POOL_SIZE; i++) {
-		if (!atomic_test_and_set_bit(data->desc_allocated, i)) {
-			return &data->descriptor_pool[i];
-		}
+static int dma_alloc_descriptor(void **descr)
+{
+	int ret = k_mem_slab_alloc(&dma_descriptor_pool_slab, (void **)descr, K_NO_WAIT);
+
+	if (!ret) {
+		memset(*descr, 0, sizeof(cy_stc_dma_descriptor_t));
 	}
 
-	return NULL;
+	return ret;
+}
+
+static void dma_free_descriptor(cy_stc_dma_descriptor_t *descr)
+{
+	k_mem_slab_free(&dma_descriptor_pool_slab, descr);
+}
+
+static void dma_free_linked_descriptors(cy_stc_dma_descriptor_t *descr)
+{
+	cy_stc_dma_descriptor_t *descr_to_remove =
+		Cy_DMA_Descriptor_GetNextDescriptor(descr);
+	cy_stc_dma_descriptor_t *descr_to_remove_next = NULL;
+
+	if ((descr == NULL) || (descr_to_remove == NULL)) {
+		return;
+	}
+
+	do {
+		descr_to_remove_next = Cy_DMA_Descriptor_GetNextDescriptor(descr_to_remove);
+		dma_free_descriptor(descr_to_remove);
+		descr_to_remove = descr_to_remove_next;
+
+	} while (descr_to_remove);
 }
 
 int ifx_cat1_dma_trig(const struct device *dev, uint32_t channel)
@@ -125,12 +149,14 @@ static int convert_dma_xy_increment_z_to_pdl(uint32_t addr_adj)
 static int ifx_cat1_dma_config(const struct device *dev, uint32_t channel,
 			       struct dma_config *config)
 {
+	int ret;
 	cy_en_dma_status_t dma_status;
 	struct ifx_cat1_dma_data *data = dev->data;
 	const struct ifx_cat1_dma_config *const cfg = dev->config;
 	cy_stc_dma_channel_config_t channel_config = {0u};
 	cy_stc_dma_descriptor_config_t descriptor_config = {0u};
 	cy_stc_dma_descriptor_t *descriptor = NULL;
+	cy_stc_dma_descriptor_t *next_descriptor = NULL;
 
 	if (channel >= cfg->num_channels) {
 		LOG_ERR("Unsupported channel");
@@ -166,6 +192,9 @@ static int ifx_cat1_dma_config(const struct device *dev, uint32_t channel,
 	data->channels[channel].error_callback_dis = config->error_callback_dis;
 	data->channels[channel].sw_triggered =
 		(config->channel_direction == MEMORY_TO_MEMORY) ? 1 : config->source_handshake;
+
+	/* free any previously linked descriptors */
+	dma_free_linked_descriptors(&data->channels[channel].descr);
 
 	/* Get first descriptor */
 	descriptor = &data->channels[channel].descr;
@@ -246,6 +275,14 @@ static int ifx_cat1_dma_config(const struct device *dev, uint32_t channel,
 			descriptor_config.yCount = 1;
 			descriptor_config.srcYincrement = 0;
 			descriptor_config.dstYincrement = 0;
+			/* For 1D transfers, use dest_scatter_interval to specify the
+			 * destination address increment value.
+			 */
+			if (block_config->dest_scatter_interval != 0) {
+				descriptor_config.dstXincrement =
+					descriptor_config.dstXincrement *
+					block_config->dest_scatter_interval;
+			}
 		}
 
 		/* Set source and destination for descriptor
@@ -259,10 +296,12 @@ static int ifx_cat1_dma_config(const struct device *dev, uint32_t channel,
 
 		/* Allocate next descriptor if need */
 		if (i + 1u < config->block_count) {
-			descriptor_config.nextDescriptor = ifx_cat1_dma_alloc_descriptor(dev);
-			if (descriptor_config.nextDescriptor == NULL) {
-				LOG_ERR("ERROR: can not allocate DMA descriptor");
+			ret = dma_alloc_descriptor((void **)&next_descriptor);
+			if (ret) {
+				LOG_ERR("Can't allocate new descriptor: %d", ret);
+				return -EINVAL;
 			}
+			descriptor_config.nextDescriptor = next_descriptor;
 		} else {
 			if (cfg->enable_chaining) {
 				descriptor_config.nextDescriptor = descriptor;
